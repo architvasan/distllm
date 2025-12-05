@@ -1,9 +1,11 @@
-"""Search for text in a dataset using FAISS without quantization."""
+"""Search for text in a dataset."""
 
 from __future__ import annotations
 
+import functools
 import time
 import warnings
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 from typing import ClassVar
@@ -15,6 +17,9 @@ import torch
 from datasets import Dataset
 from datasets.search import BatchedSearchResults
 from pydantic import Field
+from sentence_transformers.quantization import quantize_embeddings
+from sentence_transformers.quantization import semantic_search_faiss
+from tqdm import tqdm
 
 from distllm.embed import Encoder
 from distllm.embed import EncoderConfigs
@@ -24,6 +29,31 @@ from distllm.embed import Pooler
 from distllm.embed import PoolerConfigs
 from distllm.utils import BaseConfig
 from distllm.utils import batch_data
+
+
+def quantize_dataset(dataset_path: Path, precision: str) -> np.ndarray:
+    """Quantize the embeddings in the dataset to the specified precision.
+
+    Parameters
+    ----------
+    dataset_path : Path
+        The path to the dataset.
+    precision : str
+        The desired precision for the embeddings. Valid options are:
+        "float32", "uint8", "int8", "ubinary", and "binary".
+        But FAISS only supports "float32", "uint8", and "ubinary".
+    """
+    # Load the dataset
+    dataset = Dataset.load_from_disk(str(dataset_path))
+    dataset.set_format('numpy', columns=['embeddings'])
+
+    # Load the pre-computed fp32 embeddings
+    embeddings = dataset['embeddings']
+
+    # Quantize the embeddings
+    quantized_embeddings = quantize_embeddings(embeddings, precision=precision)
+
+    return quantized_embeddings
 
 
 class FaissIndexV2Config(BaseConfig):
@@ -40,29 +70,64 @@ class FaissIndexV2Config(BaseConfig):
         ...,
         description='The path to the FAISS index.',
     )
+    dataset_chunk_paths: list[Path] | None = Field(
+        default=None,
+        description='The paths to the dataset chunks, each containing an '
+        'HF dataset with the document text and fp32 embeddings, to be '
+        'quantized and added to the FAISS index during creation.',
+    )
+    precision: str = Field(
+        default='float32',
+        description='The desired precision for the embeddings '
+        '[float32, ubinary].',
+    )
     search_algorithm: str = Field(
         default='exact',
         description='The desired search algorithm [exact, hnsw].',
     )
+    rescore_multiplier: int = Field(
+        default=2,
+        description='Oversampling factor for rescoring.',
+    )
+    num_quantization_workers: int = Field(
+        default=1,
+        description='The number of quantization process workers.',
+    )
 
 
 class FaissIndexV2:
-    """FAISS index using sentence transformers with float32 embeddings (no quantization).
+    """FAISS index using sentence transformers.
 
     Supported FAISS indexes:
-        - IndexFlatIP (exact, inner product)
-        - IndexHNSWFlat (approximate, inner product)
+        - IndexFlatIP
+        - IndexHNSWFlat
+        - IndexBinaryFlat
+        - IndexBinaryHNSW
 
-    Uses float32 precision for embeddings.
+    Supported embedding precision:
+        - float32
+        - ubinary
+
+    Supported search algorithms:
+        - exact
+        - hnsw
+
+    If the FAISS index does not exist, it will be created and saved to disk.
+    Supports parallel quantization of HF dataset chunks using a process pool.
+
     For more information, see:
-    https://github.com/facebookresearch/faiss
+    https://github.com/UKPLab/sentence-transformers/blob/master/examples/applications/embedding-quantization/semantic_search_faiss.py
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         dataset_dir: Path,
         faiss_index_path: Path,
+        dataset_chunk_paths: list[Path] | None = None,
+        precision: str = 'float32',
         search_algorithm: str = 'exact',
+        rescore_multiplier: int = 2,
+        num_quantization_workers: int = 1,
     ) -> None:
         """Initialize the FAISS index.
 
@@ -74,22 +139,49 @@ class FaissIndexV2:
         faiss_index_path : Path
             The path to the FAISS index, if it does not exist,
             it will be created and saved to this path.
+        dataset_chunk_paths : list[Path], optional
+            The paths to the dataset chunks, each containing
+            an HF dataset with the document text and fp32 embeddings,
+            to be quantized and added to the FAISS index during creation.
+            Each dataset chunk is quantized in parallel using a process
+            pool, and the quantized embeddings are concatenated and added
+            to the index, by default None.
+        precision : str, optional
+            The desired precision for the embeddings, by default 'float32'.
+            Supported options are 'float32' and 'ubinary'. If 'ubinary' is
+            chosen, the embeddings will be quantized to an unsigned binary
+            format, which is more memory efficient than 'float32'.
         search_algorithm : str, optional
             Whether to use exact search or approximate FAISS search,
             by default 'exact'. Supported options are 'exact' and 'hnsw'.
+        rescore_multiplier : int, optional
+            Oversampling factor for rescoring. The code will now search
+            `top_k * rescore_multiplier` samples and then rescore to only
+            keep `top_k`, by default 2.
+        num_quantization_workers : int, optional
+            The number of quantization process workers, by default 1.
         """
         self.dataset_dir = dataset_dir
         self.faiss_index_path = faiss_index_path
+        self.dataset_chunk_paths = dataset_chunk_paths
+        self.precision = precision
         self.search_algorithm = search_algorithm
+        self.rescore_multiplier = rescore_multiplier
+        self.num_workers = num_quantization_workers
 
-        # Validate the search algorithm
+        # Validate the precision and search algorithm
+        if self.precision not in ('float32', 'ubinary'):
+            raise ValueError(
+                f'Invalid precision {precision}. '
+                'Options: ["float32" and "ubinary"]',
+            )
         if self.search_algorithm not in ('exact', 'hnsw'):
             raise ValueError(
                 f'Invalid search_algorithm {search_algorithm}. '
                 'Options: ["exact" and "hnsw"]',
             )
 
-        # Load the dataset from disk
+        # Load the  from disk
         self.dataset = Dataset.load_from_disk(str(dataset_dir))
 
         # Initialize the FAISS index
@@ -102,32 +194,68 @@ class FaissIndexV2:
 
     def _load_index_from_disk(self) -> faiss.Index:
         """Load the FAISS index from disk."""
-        return faiss.read_index(str(self.faiss_index_path))
+        if self.precision in ('float32', 'uint8'):
+            return faiss.read_index(str(self.faiss_index_path))
+        else:
+            return faiss.read_index_binary(str(self.faiss_index_path))
 
     def _create_index(self) -> faiss.Index:
-        """Create a FAISS index from the dataset embeddings."""
-        # Load the pre-computed fp32 embeddings from dataset
-        self.dataset.set_format('numpy', columns=['embeddings'])
-        embeddings = np.array(self.dataset['embeddings']).astype('float32')
+        # Define the worker function for quantization
+        func = functools.partial(quantize_dataset, precision=self.precision)
+
+        # Check if the dataset is chunked
+        if self.dataset_chunk_paths is None:
+            embeddings = quantize_dataset(self.dataset_dir, self.precision)
+
+        else:
+            # Quantize the embeddings in each dataset chunk in parallel
+            quantized_embeddings = []
+            with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
+                for x in tqdm(
+                    executor.map(func, self.dataset_chunk_paths),
+                    desc='Quantizing embeddings',
+                ):
+                    quantized_embeddings.append(x)
+
+            # Concatenate the quantized embeddings
+            embeddings = np.concatenate(quantized_embeddings)
 
         print(
-            f'Creating FAISS index using {self.search_algorithm} search '
-            f'with embeddings shape: {embeddings.shape}',
+            f'Creating {self.precision} FAISS index using '
+            f'{self.search_algorithm} search with embeddings '
+            f'shape: {embeddings.shape}',
         )
 
-        # Build the FAISS index
-        if self.search_algorithm == 'exact':
-            # Use inner product similarity for exact search
-            index = faiss.IndexFlatIP(embeddings.shape[1])
-        else:  # hnsw
-            # Use the HNSW algorithm for approximate search
-            index = faiss.IndexHNSWFlat(embeddings.shape[1], 16)
+        # Build the FAISS index (logic borrowed from
+        # sentence_transformers.quantization.semantic_search_faiss)
+        if self.precision in ('float32', 'uint8'):
+            if self.search_algorithm == 'exact':
+                # Use the inner product similarity for float32
+                index = faiss.IndexFlatIP(embeddings.shape[1])
+            else:
+                # Use the HNSW algorithm for approximate search
+                index = faiss.IndexHNSWFlat(embeddings.shape[1], 16)
+
+        elif self.precision == 'ubinary':
+            if self.search_algorithm == 'exact':
+                # Use exact search with the binary index
+                index = faiss.IndexBinaryFlat(embeddings.shape[1] * 8)
+            else:
+                # Use the HNSW algorithm for approximate search
+                index = faiss.IndexBinaryHNSW(embeddings.shape[1] * 8, 16)
+        else:
+            raise ValueError(f'Invalid precision {self.precision}')
 
         # Add the embeddings to the index
         index.add(embeddings)
 
         print('Writing the index to disk...')
-        faiss.write_index(index, str(self.faiss_index_path))
+
+        # Save the index to disk
+        if self.precision in ('float32', 'uint8'):
+            faiss.write_index(index, str(self.faiss_index_path))
+        else:
+            faiss.write_index_binary(index, str(self.faiss_index_path))
 
         return index
 
@@ -137,16 +265,16 @@ class FaissIndexV2:
         Parameters
         ----------
         embeddings : np.ndarray
-            The embeddings to transform (should be float32).
+            The embeddings to transform.
 
         Returns
         -------
         np.ndarray
-            The transformed embeddings (L2 normalized).
+            The transformed embeddings.
         """
         # Normalize the embeddings for inner product search
-        embeddings = embeddings.astype('float32')
         faiss.normalize_L2(embeddings)
+
         return embeddings
 
     def search(
@@ -160,39 +288,46 @@ class FaissIndexV2:
         Parameters
         ----------
         query_embedding : np.ndarray
-            The query embeddings (shape: [num_queries, embedding_dim]).
+            The query embeddings.
         top_k : int
             The number of top results to return, by default 1.
         score_threshold : float
             The score threshold to use for filtering out results,
-            by default 0.0 (keep all results).
+            by default we keep everything 0.0.
 
         Returns
         -------
         BatchedSearchResults
             A namedtuple with list[list[float]] (.total_scores) of scores for
-            each of the top_k returned items and a list[list[int]]
+            each  of the top_k returned items and a list[list[int]]]
             (.total_indices) of indices for each of the top_k returned items
             for each query.
         """
-        # Ensure embeddings are float32
-        query_embedding = query_embedding.astype('float32')
+        # TODO: Decide if we should normalize the query embeddings here.
+        # Normalize the query embeddings
+        # faiss.normalize_L2(query_embeddings)
 
         t_start = time.perf_counter()
-        
-        # Search the index using FAISS directly
-        # Returns: distances (scores), indices
-        distances, indices = self.faiss_index.search(query_embedding, top_k)
+        # Search the index for the top k similar results
+        # The list of search results is in the format:
+        # [[{"corpus_id": int, "score": float}, ...], ...]
+        results, *_ = semantic_search_faiss(
+            query_embedding,
+            corpus_index=self.faiss_index,
+            corpus_precision=self.precision,
+            top_k=top_k,
+            rescore=self.precision != 'float32',
+            rescore_multiplier=self.rescore_multiplier,
+            exact=self.search_algorithm == 'exact',
+        )
 
-        search_time = time.perf_counter() - t_start
-        print(f'Search time: {search_time:.6f} seconds')
-        print(f'Retrieved {len(indices)} results per query')
+        print(f'Search time: {time.perf_counter() - t_start:.6f} seconds')
+        print(f'Retrieved {len(results)} results')
 
         # Convert the search results to a BatchedSearchResults object
-        # distances are inner product scores (higher is better)
         results = BatchedSearchResults(
-            total_scores=distances.tolist(),
-            total_indices=indices.tolist(),
+            total_scores=[[r['score'] for r in res] for res in results],
+            total_indices=[[r['corpus_id'] for r in res] for res in results],
         )
 
         # Filter out results with the score threshold
@@ -223,16 +358,16 @@ class FaissIndexV2:
         if not score_threshold:
             return results
 
-        # Filter out results with scores below the threshold
+        # Filter out results with scores not satisfying the threshold
         new_total_indices, new_total_scores = [], []
         for indices, scores in zip(
             results.total_indices,
             results.total_scores,
         ):
             # Keep only the indices and scores satisfying the threshold
-            # (inner product similarity: higher scores are better)
             new_indices, new_scores = [], []
             for index, score in zip(indices, scores):
+                # Assumes inner product similarity
                 if score >= score_threshold:
                     new_indices.append(index)
                     new_scores.append(score)
@@ -258,8 +393,8 @@ class FaissIndexV2:
 
         Returns
         -------
-        list[Any]
-            The values for the given indices.
+        Dataset
+            The dataset for the given indices.
         """
         return [self.dataset[i][key] for i in indices]
 
@@ -295,7 +430,7 @@ class FaissIndexV1Config(BaseConfig):
 
 
 class FaissIndexV1:
-    """FAISS index using HuggingFace datasets integration.
+    """FAISS index.
 
     For a more scalable implementation, consider using FaissIndexV2.
     """
@@ -739,6 +874,7 @@ class Retriever:
         # Convert the query embeddings to numpy float32 for FAISS
         pool_embeds = pool_embeds.cpu().numpy().astype(np.float32)
 
+        # TODO: Consider moving this into faiss index internals
         # Transform the embeddings according to the faiss strategy
         pool_embeds = self.faiss_index.transform(pool_embeds)
 
