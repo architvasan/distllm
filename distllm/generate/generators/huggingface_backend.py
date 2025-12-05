@@ -50,6 +50,10 @@ class HuggingFaceGeneratorConfig(BaseConfig):
         1,
         description='The number of prompts to process at once.',
     )
+    device: str | None = Field(
+        None,
+        description="Device to use ('cuda', 'xpu', 'cpu', or 'auto').",
+    )
 
 
 class HuggingFaceGenerator:
@@ -60,6 +64,8 @@ class HuggingFaceGenerator:
         import torch
         from transformers import AutoModel
         from transformers import AutoTokenizer
+
+        from distllm.torch_utils import get_device
 
         model_kwargs = {}
 
@@ -100,9 +106,7 @@ class HuggingFaceGenerator:
 
         # Load the model onto the device
         if not config.quantization:
-            device = torch.device(
-                'cuda' if torch.cuda.is_available() else 'cpu',
-            )
+            device = get_device(config.device)
             model.to(device)
 
         # Compile the model for faster inference

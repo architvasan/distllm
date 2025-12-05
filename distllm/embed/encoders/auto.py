@@ -29,6 +29,8 @@ class AutoEncoderConfig(BaseConfig):
     compile_model: bool = False
     # Use quantization
     quantization: bool = True
+    # Device to use for inference ('cuda', 'xpu', 'cpu', or 'auto')
+    device: Optional[str] = None  # noqa: UP007
 
 
 class AutoEncoder:
@@ -39,6 +41,8 @@ class AutoEncoder:
         import torch
         from transformers import AutoModel
         from transformers import AutoTokenizer
+
+        from distllm.torch_utils import get_device
 
         model_kwargs = {}
 
@@ -83,9 +87,7 @@ class AutoEncoder:
 
         # Load the model onto the device
         if not config.quantization:
-            device = torch.device(
-                'cuda' if torch.cuda.is_available() else 'cpu',
-            )
+            device = get_device(config.device)
             model.to(device)
 
         # Compile the model for faster inference

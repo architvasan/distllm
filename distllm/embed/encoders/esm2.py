@@ -29,6 +29,8 @@ class Esm2EncoderConfig(BaseConfig):
     compile_model: bool = False
     # Use faesm implementation (faster)
     faesm: bool = False
+    # Device to use for inference ('cuda', 'xpu', 'cpu', or 'auto')
+    device: str | None = None
 
 
 class Esm2Encoder:
@@ -36,8 +38,9 @@ class Esm2Encoder:
 
     def __init__(self, config: Esm2EncoderConfig):
         """Initialize the encoder."""
-        import torch
         from transformers import EsmTokenizer
+
+        from distllm.torch_utils import get_device
 
         # Check if faesm is enabled
         if config.faesm:
@@ -74,7 +77,7 @@ class Esm2Encoder:
             model.eval()
 
         # Load the model onto the device
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = get_device(config.device)
         model.to(device)
 
         # Compile the model for faster inference
