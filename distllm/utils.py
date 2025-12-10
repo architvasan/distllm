@@ -53,6 +53,22 @@ class BaseConfig(BaseModel):
             data = json.load(fp)
         return cls(**data)
 
+    @classmethod
+    def from_dict(cls: type[T], data: dict[str]) -> T:
+        """Load the model from a JSON file.
+
+        Parameters
+        ----------
+        path : str
+            The path to the JSON file.
+
+        Returns
+        -------
+        T
+            A specific BaseConfig instance.
+        """
+        return cls(**data)
+
     def write_yaml(self, path: PathLike) -> None:
         """Write the model to a YAML file.
 
